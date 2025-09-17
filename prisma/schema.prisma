@@ -1,0 +1,573 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/*
+  Enhanced schema for second-hand book marketplace
+  - Edition + Listing canonical model
+  - KYC (Verification)
+  - Wallet + atomic-friendly transactions
+  - WithdrawRequest + Payout
+  - Support / Ticketing
+  - Notifications, Sessions/Devices, 2FA
+  - Author normalization and edition-author join
+  - ListingHistory for audit / price history
+  - AdminAuditLog
+  - BackgroundJob queue table (simple)
+  - Additional indexes / notes for full-text search (run as raw SQL after migrate)
+*/
+
+/* Enums */
+enum Role { 
+  USER 
+  ADMIN 
+}
+
+enum VerificationStatus { 
+  PENDING 
+  APPROVED 
+  REJECTED 
+}
+
+enum TransactionType { 
+  DEPOSIT 
+  WITHDRAW 
+  ORDER_PAYMENT 
+  SALE_INCOME 
+  REFUND 
+  ADJUSTMENT 
+}
+
+enum BookStatus { 
+  DRAFT 
+  PENDING 
+  APPROVED 
+  REJECTED 
+}
+
+enum Condition { 
+  NEW 
+  LIKE_NEW 
+  VERY_GOOD 
+  GOOD 
+  ACCEPTABLE 
+}
+
+enum OrderStatus { 
+  CREATED 
+  PAID 
+  SHIPPED 
+  COMPLETED 
+  CANCELLED 
+  REFUNDED 
+}
+
+enum TicketStatus { 
+  OPEN 
+  PENDING 
+  RESOLVED 
+  CLOSED 
+}
+
+enum TicketPriority { 
+  LOW 
+  MEDIUM 
+  HIGH 
+  URGENT 
+}
+
+enum PayoutStatus { 
+  REQUESTED 
+  PROCESSING 
+  PAID 
+  REJECTED 
+}
+
+enum NotificationChannel { 
+  IN_APP 
+  EMAIL 
+  SMS 
+  PUSH 
+}
+
+enum JobStatus { 
+  PENDING 
+  RUNNING 
+  FAILED 
+  COMPLETED 
+}
+
+/* Models */
+model User {
+  id                String            @id @default(uuid())
+  email             String            @unique
+  name              String
+  phone             String?           @unique
+  password          String
+  role              Role              @default(USER)
+  profilePic        String?           // S3 key / url
+  bio               String?
+  isVerified        Boolean           @default(false) // KYC approved
+  isSeller          Boolean           @default(false)
+  isSellerVerified  Boolean           @default(false)
+  twoFaEnabled      Boolean           @default(false)
+  twoFaSecret       String?           // store encrypted/encoded
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  deletedAt         DateTime?
+
+  // Relations
+  verifications     Verification[]
+  wallet            Wallet?
+  listings          Listing[]         @relation("SellerListings")
+  orders            Order[]           @relation("BuyerOrders")
+  addresses         Address[]
+  reviewsAuthored   Review[]          @relation("AuthorReviews")
+  reviewsReceived   Review[]          @relation("TargetReviews")
+  supportTicketsCreated SupportTicket[] @relation("CreatorTickets")
+  supportTicketsAssigned SupportTicket[] @relation("AssigneeTickets")
+  supportMessages    SupportMessage[]
+  notifications      Notification[]
+  sessions           Session[]
+  devices            Device[]
+  payouts            Payout[]
+  withdrawRequests   WithdrawRequest[]
+  approvedListings   Listing[]         @relation("ApprovedListings")
+  orderItems         OrderItem[]
+  listingHistories   ListingHistory[]
+  adminAuditLogs     AdminAuditLog[]
+
+  @@index([isSeller])
+  @@index([isSellerVerified])
+}
+
+model Verification {
+  id          String             @id @default(uuid())
+  userId      String
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  docType     String
+  docFront    String
+  docBack     String?
+  meta        Json?
+  status      VerificationStatus @default(PENDING)
+  adminNote   String?
+  reviewedBy  String?
+  reviewedAt  DateTime?
+  createdAt   DateTime           @default(now())
+
+  @@index([userId])
+}
+
+model Wallet {
+  id        String              @id @default(uuid())
+  userId    String              @unique
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance   Decimal             @db.Decimal(14,2) @default(0.00)
+  currency  String              @default("IRR")
+  txns      WalletTransaction[]
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  @@index([userId])
+}
+
+model WalletTransaction {
+  id           String          @id @default(uuid())
+  walletId     String
+  wallet       Wallet          @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type         TransactionType
+  amount       Decimal         @db.Decimal(14,2)
+  balanceAfter Decimal         @db.Decimal(14,2)
+  refType      String?
+  refId        String?
+  meta         Json?
+  createdAt    DateTime        @default(now())
+
+  @@index([walletId])
+  @@index([refType, refId])
+}
+
+model WithdrawRequest {
+  id         String             @id @default(uuid())
+  userId     String
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount     Decimal            @db.Decimal(14,2)
+  currency   String             @default("IRR")
+  bankInfo   Json
+  status     VerificationStatus @default(PENDING)
+  adminNote  String?
+  reviewedBy String?
+  reviewedAt DateTime?
+  walletTxnId String?
+  createdAt  DateTime           @default(now())
+
+  @@index([userId])
+}
+
+model Payout {
+  id         String       @id @default(uuid())
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount     Decimal      @db.Decimal(14,2)
+  currency   String       @default("IRR")
+  fee        Decimal?     @db.Decimal(14,2)
+  status     PayoutStatus @default(REQUESTED)
+  meta       Json?
+  processedBy String?
+  processedAt DateTime?
+  createdAt  DateTime     @default(now())
+
+  @@index([userId])
+}
+
+/* Authors normalized */
+model Author {
+  id        String    @id @default(uuid())
+  name      String
+  slug      String    @unique
+  bio       String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  editions  Edition[] @relation("EditionAuthors")
+}
+
+model Edition {
+  id            String     @id @default(uuid())
+  title         String
+  subtitle      String?
+  authors       String[]   // denormalized list for quick access
+  publisher     String?
+  publishedYear Int?
+  language      String?
+  description   String?
+  pageCount     Int?
+  coverKey      String?
+  identifiers   Json?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  // relations
+  listings      Listing[]
+  reviews       Review[]
+  authorsRel    Author[]   @relation("EditionAuthors")
+  orderItems    OrderItem[]
+
+  @@index([title])
+  @@index([authors])
+}
+
+model Listing {
+  id            String      @id @default(uuid())
+  editionId     String
+  edition       Edition     @relation(fields: [editionId], references: [id], onDelete: Cascade)
+  sellerId      String
+  seller        User        @relation("SellerListings", fields: [sellerId], references: [id], onDelete: Cascade)
+  price         Decimal     @db.Decimal(10,2)
+  currency      String      @default("IRR")
+  condition     Condition
+  conditionNote String?
+  quantity      Int         @default(1)
+  location      String?
+  status        BookStatus  @default(DRAFT)
+  adminNote     String?
+  approvedById  String?
+  approvedBy    User?       @relation("ApprovedListings", fields: [approvedById], references: [id])
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  deletedAt     DateTime?
+
+  images        ListingImage[]
+  orderItems    OrderItem[]
+  histories     ListingHistory[]
+
+  @@index([editionId])
+  @@index([sellerId])
+  @@index([price])
+}
+
+model ListingImage {
+  id        String   @id @default(uuid())
+  listingId String
+  listing   Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  key       String
+  altText   String?
+  order     Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([listingId])
+}
+
+/* Keep categories */
+model Category {
+  id        String     @id @default(uuid())
+  name      String
+  slug      String     @unique
+  parentId  String?
+  parent    Category?  @relation("CategoryChildren", fields: [parentId], references: [id])
+  children  Category[] @relation("CategoryChildren")
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @default(now())
+
+  @@index([name])
+}
+
+model Address {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label     String?
+  line1     String
+  line2     String?
+  city      String
+  state     String?
+  postal    String?
+  country   String
+  phone     String?
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  orders    Order[]
+
+  @@index([userId])
+}
+
+model Order {
+  id             String       @id @default(uuid())
+  buyerId        String
+  buyer          User         @relation("BuyerOrders", fields: [buyerId], references: [id], onDelete: Cascade)
+  items          OrderItem[]
+  subtotal       Decimal      @db.Decimal(12,2)
+  shippingAmount Decimal      @db.Decimal(12,2) @default(0.00)
+  platformFee    Decimal      @db.Decimal(12,2) @default(0.00)
+  totalAmount    Decimal      @db.Decimal(12,2)
+  currency       String       @default("IRR")
+  status         OrderStatus  @default(CREATED)
+  shippingAddrId String?
+  shippingAddr   Address?     @relation(fields: [shippingAddrId], references: [id])
+  paymentRef     String?
+  placedAt       DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  deletedAt      DateTime?
+  payment        Payment?
+
+  @@index([buyerId])
+  @@index([placedAt])
+}
+
+model OrderItem {
+  id            String   @id @default(uuid())
+  orderId       String
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  listingId     String
+  listing       Listing  @relation(fields: [listingId], references: [id])
+  editionId     String
+  edition       Edition  @relation(fields: [editionId], references: [id])
+  sellerId      String
+  seller        User     @relation(fields: [sellerId], references: [id])
+  quantity      Int
+  unitPrice     Decimal  @db.Decimal(10,2)
+  lineTotal     Decimal  @db.Decimal(12,2)
+  sellerPayout  Decimal  @db.Decimal(12,2)
+  platformFee   Decimal  @db.Decimal(12,2)
+  createdAt     DateTime @default(now())
+
+  @@index([orderId])
+  @@index([listingId])
+  @@index([editionId])
+  @@index([sellerId])
+}
+
+model Payment {
+  id           String   @id @default(uuid())
+  orderId      String   @unique
+  order        Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  gateway      String
+  gatewayRef   String
+  amount       Decimal  @db.Decimal(12,2)
+  currency     String   @default("IRR")
+  status       String
+  paidAt       DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Review {
+  id           String   @id @default(uuid())
+  authorId     String
+  author       User     @relation("AuthorReviews", fields: [authorId], references: [id], onDelete: Cascade)
+  targetUserId String?
+  targetUser   User?    @relation("TargetReviews", fields: [targetUserId], references: [id])
+  editionId    String?
+  edition      Edition? @relation(fields: [editionId], references: [id])
+  rating       Int
+  title        String?
+  comment      String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([authorId])
+  @@index([targetUserId])
+  @@index([editionId])
+}
+
+/* Support / Ticketing */
+model SupportTicket {
+  id           String         @id @default(uuid())
+  title        String
+  description  String?
+  creatorId    String
+  creator      User           @relation("CreatorTickets", fields: [creatorId], references: [id], onDelete: Cascade)
+  assigneeId   String?
+  assignee     User?          @relation("AssigneeTickets", fields: [assigneeId], references: [id])
+  status       TicketStatus   @default(OPEN)
+  priority     TicketPriority @default(MEDIUM)
+  category     String?
+  tags         String[]       @default([])
+  messages     SupportMessage[]
+  isInternal   Boolean        @default(false)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  closedAt     DateTime?
+
+  @@index([creatorId])
+  @@index([assigneeId])
+}
+
+model SupportMessage {
+  id            String            @id @default(uuid())
+  ticketId      String
+  ticket        SupportTicket     @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId      String
+  author        User              @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  body          String
+  isFromAdmin   Boolean           @default(false)
+  attachments   SupportAttachment[]
+  createdAt     DateTime          @default(now())
+  editedAt      DateTime?
+
+  @@index([ticketId])
+  @@index([authorId])
+}
+
+model SupportAttachment {
+  id          String   @id @default(uuid())
+  messageId   String
+  message     SupportMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  key         String
+  filename    String
+  contentType String?
+  size        Int?
+  createdAt   DateTime @default(now())
+
+  @@index([messageId])
+}
+
+/* Notifications */
+model Notification {
+  id        String               @id @default(uuid())
+  userId    String
+  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   NotificationChannel
+  title     String
+  body      String
+  data      Json?
+  read      Boolean              @default(false)
+  createdAt DateTime             @default(now())
+
+  @@index([userId])
+  @@index([read])
+}
+
+/* Sessions / Devices (security) */
+model Session {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token       String   @unique
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  expiresAt   DateTime?
+
+  @@index([userId])
+}
+
+model Device {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId    String
+  name        String?
+  platform    String?
+  lastSeenAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, deviceId])
+}
+
+/* Listing history (price/status/quantity audit) */
+model ListingHistory {
+  id          String   @id @default(uuid())
+  listingId   String
+  listing     Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  changedById String?
+  changedBy   User?    @relation(fields: [changedById], references: [id])
+  changeType  String   // e.g. PRICE_UPDATE, STATUS_CHANGE, QUANTITY_CHANGE
+  oldValue    Json?
+  newValue    Json?
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  @@index([listingId])
+  @@index([changedById])
+}
+
+/* Admin audit log for sensitive actions */
+model AdminAuditLog {
+  id          String   @id @default(uuid())
+  adminId     String
+  admin       User     @relation(fields: [adminId], references: [id])
+  action      String   // e.g. KYC_APPROVE, LISTING_APPROVE, WITHDRAW_APPROVE
+  targetType  String?  // e.g. USER, LISTING, ORDER
+  targetId    String?
+  meta        Json?
+  ip          String?
+  createdAt   DateTime @default(now())
+
+  @@index([adminId])
+  @@index([action])
+}
+
+/* Simple background job queue */
+model BackgroundJob {
+  id        String   @id @default(uuid())
+  name      String
+  payload   Json?
+  status    JobStatus @default(PENDING)
+  attempts  Int      @default(0)
+  lastError String?
+  runAt     DateTime?
+  finishedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/* Full-text search notes: create tsvector columns and GIN indexes with raw SQL after migrate.
+   Example (execute as raw SQL migration):
+   ALTER TABLE "Edition" ADD COLUMN search_vector tsvector;
+   UPDATE "Edition" SET search_vector = to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(array_to_string(authors,' '), ''));
+   CREATE INDEX edition_search_idx ON "Edition" USING GIN(search_vector);
+*/
+
+/* CHECK constraints and DB-level validations: add via raw SQL migrations where needed
+   e.g. rating range: ALTER TABLE "Review" ADD CONSTRAINT rating_range CHECK (rating >= 1 AND rating <= 5);
+*/
+
+/* End of schema */
